@@ -13,6 +13,52 @@ function json(data: unknown, status = 200) {
   });
 }
 
+// ── Validation helpers ──
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const VALID_STATUSES = new Set(["Approved", "Rejected", "Fulfilled"]);
+
+function isUUID(v: unknown): v is string {
+  return typeof v === "string" && UUID_RE.test(v);
+}
+
+function isNonEmptyString(v: unknown, maxLen = 255): v is string {
+  return (
+    typeof v === "string" && v.trim().length > 0 && v.trim().length <= maxLen
+  );
+}
+
+function isOptionalString(v: unknown, maxLen = 255): boolean {
+  return (
+    v === undefined ||
+    v === null ||
+    (typeof v === "string" && v.length <= maxLen)
+  );
+}
+
+function isPositiveInt(v: unknown, max = 10000): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= max;
+}
+
+function clampInt(
+  raw: string | null,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = parseInt(raw || String(fallback), 10);
+  if (isNaN(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function safeParseBody(body: unknown): body is Record<string, unknown> {
+  return typeof body === "object" && body !== null && !Array.isArray(body);
+}
+
+// ── Main handler ──
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -20,7 +66,7 @@ Deno.serve(async (req) => {
 
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
 
   const url = new URL(req.url);
@@ -29,18 +75,35 @@ Deno.serve(async (req) => {
   try {
     // ============================================================
     // POST /orders — Create a new draft PO
-    // Idempotent via X-Idempotency-Key header
     // ============================================================
     if (req.method === "POST" && (path === "/" || path === "/orders")) {
-      const body = await req.json();
-      const { supplier, requestor, costCenter, neededByDate, paymentTerms } = body;
+      const body = await req.json().catch(() => null);
+      if (!safeParseBody(body))
+        return json({ error: "Invalid request body" }, 400);
 
-      if (!supplier || !requestor) {
-        return json({ error: "supplier and requestor are required" }, 400);
+      const { supplier, requestor, costCenter, neededByDate, paymentTerms } =
+        body;
+
+      if (!isNonEmptyString(supplier))
+        return json({ error: "supplier is required (max 255 chars)" }, 400);
+      if (requestor !== undefined && !isOptionalString(requestor, 255))
+        return json({ error: "requestor must be <= 255 chars" }, 400);
+      if (!isOptionalString(costCenter, 100))
+        return json({ error: "costCenter must be <= 100 chars" }, 400);
+      if (neededByDate !== undefined && neededByDate !== null) {
+        if (typeof neededByDate !== "string" || !DATE_RE.test(neededByDate)) {
+          return json({ error: "neededByDate must be YYYY-MM-DD format" }, 400);
+        }
       }
+      if (!isOptionalString(paymentTerms, 50))
+        return json({ error: "paymentTerms must be <= 50 chars" }, 400);
 
       // Idempotency check
       const idempotencyKey = req.headers.get("x-idempotency-key");
+      if (idempotencyKey && !UUID_RE.test(idempotencyKey)) {
+        return json({ error: "x-idempotency-key must be a valid UUID" }, 400);
+      }
+
       if (idempotencyKey) {
         const { data: existing } = await supabase
           .from("purchase_orders")
@@ -48,25 +111,24 @@ Deno.serve(async (req) => {
           .eq("idempotency_key", idempotencyKey)
           .maybeSingle();
 
-        if (existing) {
-          return json(existing, 200); // return cached result
-        }
+        if (existing) return json(existing, 200);
       }
 
       const { data, error } = await supabase
         .from("purchase_orders")
         .insert({
-          supplier,
-          requestor,
-          cost_center: costCenter || "",
+          supplier: (supplier as string).trim(),
+          requestor: (requestor as string).trim(),
+          cost_center: typeof costCenter === "string" ? costCenter.trim() : "",
           needed_by_date: neededByDate || null,
-          payment_terms: paymentTerms || "Net 30",
+          payment_terms:
+            typeof paymentTerms === "string" ? paymentTerms.trim() : "Net 30",
           idempotency_key: idempotencyKey || null,
         })
         .select()
         .single();
 
-      if (error) return json({ error: error.message }, 500);
+      if (error) return json({ error: "Failed to create purchase order" }, 500);
       return json(data, 201);
     }
 
@@ -76,8 +138,8 @@ Deno.serve(async (req) => {
     if (req.method === "GET" && (path === "/" || path === "/orders")) {
       const status = url.searchParams.get("status");
       const supplier = url.searchParams.get("supplier");
-      const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
-      const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "20")));
+      const page = clampInt(url.searchParams.get("page"), 1, 1, 1000);
+      const limit = clampInt(url.searchParams.get("limit"), 20, 1, 100);
       const offset = (page - 1) * limit;
 
       let query = supabase
@@ -85,17 +147,37 @@ Deno.serve(async (req) => {
         .select("*", { count: "exact" })
         .order("created_at", { ascending: false });
 
-      if (status) query = query.eq("current_status", status);
-      if (supplier) query = query.eq("supplier", supplier);
+      if (status) {
+        const validStatuses = [
+          "Draft",
+          "Submitted",
+          "Approved",
+          "Rejected",
+          "Fulfilled",
+        ];
+        if (!validStatuses.includes(status))
+          return json({ error: "Invalid status filter" }, 400);
+        query = query.eq("current_status", status);
+      }
+      if (supplier) {
+        if (supplier.length > 255)
+          return json({ error: "supplier filter too long" }, 400);
+        query = query.eq("supplier", supplier);
+      }
 
       query = query.range(offset, offset + limit - 1);
 
       const { data, error, count } = await query;
-      if (error) return json({ error: error.message }, 500);
+      if (error) return json({ error: "Failed to fetch orders" }, 500);
 
       return json({
         orders: data,
-        pagination: { page, limit, total: count, totalPages: Math.ceil((count || 0) / limit) },
+        pagination: {
+          page,
+          limit,
+          total: count,
+          totalPages: Math.ceil((count || 0) / limit),
+        },
       });
     }
 
@@ -105,18 +187,56 @@ Deno.serve(async (req) => {
     const orderMatch = path.match(/^\/orders\/([^/]+)$/);
     if (req.method === "PATCH" && orderMatch) {
       const poId = orderMatch[1];
-      const body = await req.json();
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
+
+      const body = await req.json().catch(() => null);
+      if (!safeParseBody(body))
+        return json({ error: "Invalid request body" }, 400);
+
       const { requestor, costCenter, neededByDate, paymentTerms } = body;
 
-      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      const { data: po } = await supabase
+        .from("purchase_orders")
+        .select("current_status")
+        .eq("id", poId)
+        .single();
       if (!po) return json({ error: "PO not found" }, 404);
-      if (po.current_status !== "Draft") return json({ error: "Can only update Draft POs" }, 422);
+      if (po.current_status !== "Draft")
+        return json({ error: "Can only update Draft POs" }, 422);
 
       const updates: Record<string, unknown> = {};
-      if (requestor !== undefined) updates.requestor = requestor;
-      if (costCenter !== undefined) updates.cost_center = costCenter;
-      if (neededByDate !== undefined) updates.needed_by_date = neededByDate || null;
-      if (paymentTerms !== undefined) updates.payment_terms = paymentTerms;
+      if (requestor !== undefined) {
+        if (!isNonEmptyString(requestor))
+          return json({ error: "requestor must be non-empty (max 255)" }, 400);
+        updates.requestor = (requestor as string).trim();
+      }
+      if (costCenter !== undefined) {
+        if (!isOptionalString(costCenter, 100))
+          return json({ error: "costCenter must be <= 100 chars" }, 400);
+        updates.cost_center =
+          typeof costCenter === "string" ? costCenter.trim() : "";
+      }
+      if (neededByDate !== undefined) {
+        if (
+          neededByDate !== null &&
+          (typeof neededByDate !== "string" || !DATE_RE.test(neededByDate))
+        ) {
+          return json(
+            { error: "neededByDate must be YYYY-MM-DD or null" },
+            400,
+          );
+        }
+        updates.needed_by_date = neededByDate || null;
+      }
+      if (paymentTerms !== undefined) {
+        if (!isOptionalString(paymentTerms, 50))
+          return json({ error: "paymentTerms must be <= 50 chars" }, 400);
+        updates.payment_terms =
+          typeof paymentTerms === "string" ? paymentTerms.trim() : "Net 30";
+      }
+
+      if (Object.keys(updates).length === 0)
+        return json({ error: "No fields to update" }, 400);
 
       const { data, error } = await supabase
         .from("purchase_orders")
@@ -125,7 +245,7 @@ Deno.serve(async (req) => {
         .select()
         .single();
 
-      if (error) return json({ error: error.message }, 500);
+      if (error) return json({ error: "Failed to update purchase order" }, 500);
       return json(data);
     }
 
@@ -134,6 +254,7 @@ Deno.serve(async (req) => {
     // ============================================================
     if (req.method === "GET" && orderMatch) {
       const poId = orderMatch[1];
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
 
       const [poRes, linesRes, historyRes] = await Promise.all([
         supabase.from("purchase_orders").select("*").eq("id", poId).single(),
@@ -149,7 +270,8 @@ Deno.serve(async (req) => {
           .order("transitioned_at"),
       ]);
 
-      if (poRes.error || !poRes.data) return json({ error: "PO not found" }, 404);
+      if (poRes.error || !poRes.data)
+        return json({ error: "PO not found" }, 404);
 
       return json({
         ...poRes.data,
@@ -160,19 +282,29 @@ Deno.serve(async (req) => {
 
     // ============================================================
     // POST /orders/:id/lines — Add line item to draft PO
-    // Returns 409 on supplier mismatch
     // ============================================================
     const addLineMatch = path.match(/^\/orders\/([^/]+)\/lines$/);
     if (req.method === "POST" && addLineMatch) {
       const poId = addLineMatch[1];
-      const body = await req.json();
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
+
+      const body = await req.json().catch(() => null);
+      if (!safeParseBody(body))
+        return json({ error: "Invalid request body" }, 400);
+
       const { catalogItemId, quantity } = body;
 
-      if (!catalogItemId || !quantity || quantity < 1) {
-        return json({ error: "catalogItemId and quantity (>=1) required" }, 400);
-      }
+      if (!isNonEmptyString(catalogItemId, 100))
+        return json(
+          { error: "catalogItemId is required (max 100 chars)" },
+          400,
+        );
+      if (!isPositiveInt(quantity))
+        return json(
+          { error: "quantity must be an integer between 1 and 10000" },
+          400,
+        );
 
-      // Check PO is in Draft
       const { data: po } = await supabase
         .from("purchase_orders")
         .select("current_status, supplier")
@@ -180,11 +312,9 @@ Deno.serve(async (req) => {
         .single();
 
       if (!po) return json({ error: "PO not found" }, 404);
-      if (po.current_status !== "Draft") {
+      if (po.current_status !== "Draft")
         return json({ error: "Can only add lines to Draft POs" }, 422);
-      }
 
-      // Get catalog item to check supplier + get price
       const { data: item } = await supabase
         .from("catalog_items")
         .select("supplier, price_usd")
@@ -193,18 +323,17 @@ Deno.serve(async (req) => {
 
       if (!item) return json({ error: "Catalog item not found" }, 404);
 
-      // Supplier mismatch → 409 Conflict
       if (item.supplier !== po.supplier) {
         return json(
           {
             error: "Supplier mismatch",
             detail: `PO is locked to "${po.supplier}" but item belongs to "${item.supplier}"`,
           },
-          409
+          409,
         );
       }
 
-      // Upsert line item (increment quantity if exists)
+      // Upsert line item
       const { data: existingLine } = await supabase
         .from("po_line_items")
         .select("id, quantity")
@@ -214,9 +343,12 @@ Deno.serve(async (req) => {
 
       let result;
       if (existingLine) {
+        const newQty = existingLine.quantity + (quantity as number);
+        if (newQty > 10000)
+          return json({ error: "Total quantity cannot exceed 10000" }, 400);
         result = await supabase
           .from("po_line_items")
-          .update({ quantity: existingLine.quantity + quantity })
+          .update({ quantity: newQty })
           .eq("id", existingLine.id)
           .select("*, catalog_item:catalog_items(*)")
           .single();
@@ -225,15 +357,15 @@ Deno.serve(async (req) => {
           .from("po_line_items")
           .insert({
             po_id: poId,
-            catalog_item_id: catalogItemId,
-            quantity,
+            catalog_item_id: catalogItemId as string,
+            quantity: quantity as number,
             unit_price: item.price_usd,
           })
           .select("*, catalog_item:catalog_items(*)")
           .single();
       }
 
-      if (result.error) return json({ error: result.error.message }, 500);
+      if (result.error) return json({ error: "Failed to add line item" }, 500);
       return json(result.data, 201);
     }
 
@@ -243,19 +375,32 @@ Deno.serve(async (req) => {
     const updateLineMatch = path.match(/^\/orders\/([^/]+)\/lines\/([^/]+)$/);
     if (req.method === "PATCH" && updateLineMatch) {
       const [, poId, lineId] = updateLineMatch;
-      const body = await req.json();
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
+      if (!isUUID(lineId)) return json({ error: "Invalid line item ID" }, 400);
+
+      const body = await req.json().catch(() => null);
+      if (!safeParseBody(body))
+        return json({ error: "Invalid request body" }, 400);
+
       const { quantity } = body;
+      if (!isPositiveInt(quantity))
+        return json(
+          { error: "quantity must be an integer between 1 and 10000" },
+          400,
+        );
 
-      if (!quantity || quantity < 1) return json({ error: "quantity must be >= 1" }, 400);
-
-      // Check PO is Draft
-      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      const { data: po } = await supabase
+        .from("purchase_orders")
+        .select("current_status")
+        .eq("id", poId)
+        .single();
       if (!po) return json({ error: "PO not found" }, 404);
-      if (po.current_status !== "Draft") return json({ error: "Can only modify Draft POs" }, 422);
+      if (po.current_status !== "Draft")
+        return json({ error: "Can only modify Draft POs" }, 422);
 
       const { data, error } = await supabase
         .from("po_line_items")
-        .update({ quantity })
+        .update({ quantity: quantity as number })
         .eq("id", lineId)
         .eq("po_id", poId)
         .select("*, catalog_item:catalog_items(*)")
@@ -270,32 +415,49 @@ Deno.serve(async (req) => {
     // ============================================================
     if (req.method === "DELETE" && updateLineMatch) {
       const [, poId, lineId] = updateLineMatch;
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
+      if (!isUUID(lineId)) return json({ error: "Invalid line item ID" }, 400);
 
-      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      const { data: po } = await supabase
+        .from("purchase_orders")
+        .select("current_status")
+        .eq("id", poId)
+        .single();
       if (!po) return json({ error: "PO not found" }, 404);
-      if (po.current_status !== "Draft") return json({ error: "Can only modify Draft POs" }, 422);
+      if (po.current_status !== "Draft")
+        return json({ error: "Can only modify Draft POs" }, 422);
 
-      const { error } = await supabase.from("po_line_items").delete().eq("id", lineId).eq("po_id", poId);
-      if (error) return json({ error: error.message }, 500);
+      const { error } = await supabase
+        .from("po_line_items")
+        .delete()
+        .eq("id", lineId)
+        .eq("po_id", poId);
+      if (error) return json({ error: "Failed to delete line item" }, 500);
 
       return json({ success: true }, 200);
     }
 
     // ============================================================
     // POST /orders/:id/submit — Submit draft PO
-    // Idempotent via X-Idempotency-Key
     // ============================================================
     const submitMatch = path.match(/^\/orders\/([^/]+)\/submit$/);
     if (req.method === "POST" && submitMatch) {
       const poId = submitMatch[1];
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
 
-      const { data: po } = await supabase.from("purchase_orders").select("*").eq("id", poId).single();
+      const { data: po } = await supabase
+        .from("purchase_orders")
+        .select("*")
+        .eq("id", poId)
+        .single();
       if (!po) return json({ error: "PO not found" }, 404);
       if (po.current_status !== "Draft") {
-        return json({ error: `Cannot submit PO in "${po.current_status}" status` }, 422);
+        return json(
+          { error: `Cannot submit PO in "${po.current_status}" status` },
+          422,
+        );
       }
 
-      // Check it has line items
       const { count } = await supabase
         .from("po_line_items")
         .select("id", { count: "exact", head: true })
@@ -312,23 +474,37 @@ Deno.serve(async (req) => {
         .select()
         .single();
 
-      if (error) return json({ error: error.message }, 500);
+      if (error) return json({ error: "Failed to submit purchase order" }, 500);
       return json(data);
     }
 
     // ============================================================
     // POST /orders/:id/status — Transition PO status
-    // Body: { status: "Approved"|"Rejected"|"Fulfilled", note?: string }
     // ============================================================
     const statusMatch = path.match(/^\/orders\/([^/]+)\/status$/);
     if (req.method === "POST" && statusMatch) {
       const poId = statusMatch[1];
-      const body = await req.json();
+      if (!isUUID(poId)) return json({ error: "Invalid PO ID" }, 400);
+
+      const body = await req.json().catch(() => null);
+      if (!safeParseBody(body))
+        return json({ error: "Invalid request body" }, 400);
+
       const { status, note } = body;
 
-      if (!status) return json({ error: "status is required" }, 400);
+      if (typeof status !== "string" || !VALID_STATUSES.has(status)) {
+        return json(
+          { error: `status must be one of: ${[...VALID_STATUSES].join(", ")}` },
+          400,
+        );
+      }
+      if (
+        note !== undefined &&
+        (typeof note !== "string" || note.length > 1000)
+      ) {
+        return json({ error: "note must be a string (max 1000 chars)" }, 400);
+      }
 
-      // Update status (DB trigger validates transition)
       const { data, error } = await supabase
         .from("purchase_orders")
         .update({ current_status: status })
@@ -340,14 +516,13 @@ Deno.serve(async (req) => {
         if (error.message.includes("Invalid status transition")) {
           return json({ error: error.message }, 422);
         }
-        return json({ error: error.message }, 500);
+        return json({ error: "Failed to update status" }, 500);
       }
 
-      // Update the note on the auto-created history entry
       if (note) {
         await supabase
           .from("po_status_history")
-          .update({ note })
+          .update({ note: (note as string).trim() })
           .eq("po_id", poId)
           .eq("status", status)
           .order("transitioned_at", { ascending: false })
@@ -358,7 +533,7 @@ Deno.serve(async (req) => {
     }
 
     return json({ error: "Not found" }, 404);
-  } catch (err) {
-    return json({ error: err.message }, 500);
+  } catch (_err) {
+    return json({ error: "Internal server error" }, 500);
   }
 });
