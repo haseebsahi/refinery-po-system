@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 215 25% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 215 25% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 25% 12%;
+
+    --primary: 215 60% 22%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 18% 93%;
+    --secondary-foreground: 215 25% 12%;
+
+    --muted: 210 15% 95%;
+    --muted-foreground: 215 12% 50%;
+
+    --accent: 36 90% 50%;
+    --accent-foreground: 215 25% 12%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+
+    --success: 152 60% 36%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 36 90% 50%;
+    --warning-foreground: 215 25% 12%;
+
+    --info: 205 75% 48%;
+    --info-foreground: 0 0% 100%;
+
+    --border: 214 20% 88%;
+    --input: 214 20% 88%;
+    --ring: 215 60% 22%;
+
+    --radius: 0.5rem;
+
+    --sidebar-background: 215 60% 22%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 36 90% 50%;
+    --sidebar-primary-foreground: 215 25% 12%;
+    --sidebar-accent: 215 50% 30%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 215 40% 28%;
+    --sidebar-ring: 36 90% 50%;
+
+    --steel: 215 20% 65%;
+    --steel-dark: 215 25% 35%;
+  }
+
+  .dark {
+    --background: 215 25% 10%;
+    --foreground: 210 40% 98%;
+    --card: 215 25% 14%;
+    --card-foreground: 210 40% 98%;
+    --popover: 215 25% 14%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 36 90% 50%;
+    --primary-foreground: 215 25% 12%;
+    --secondary: 215 20% 20%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 215 20% 18%;
+    --muted-foreground: 215 12% 60%;
+    --accent: 36 90% 50%;
+    --accent-foreground: 215 25% 12%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 215 20% 22%;
+    --input: 215 20% 22%;
+    --ring: 36 90% 50%;
+    --sidebar-background: 215 30% 8%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 36 90% 50%;
+    --sidebar-primary-foreground: 215 25% 12%;
+    --sidebar-accent: 215 25% 14%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 215 20% 16%;
+    --sidebar-ring: 36 90% 50%;
+    --steel: 215 15% 45%;
+    --steel-dark: 215 15% 30%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  }
+
+  code, .font-mono {
+    font-family: 'IBM Plex Mono', monospace;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-accent;
+  }
+}

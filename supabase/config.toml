@@ -1,0 +1,10 @@
+project_id = "otqeooorakoeswjbmotk"
+
+[functions.catalog-service]
+verify_jwt = false
+
+[functions.procurement-service]
+verify_jwt = false
+
+[functions.seed-catalog]
+verify_jwt = false

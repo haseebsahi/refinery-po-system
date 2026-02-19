@@ -1,0 +1,364 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-idempotency-key, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+function json(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  const url = new URL(req.url);
+  const path = url.pathname.replace(/^\/procurement-service\/?/, "/");
+
+  try {
+    // ============================================================
+    // POST /orders — Create a new draft PO
+    // Idempotent via X-Idempotency-Key header
+    // ============================================================
+    if (req.method === "POST" && (path === "/" || path === "/orders")) {
+      const body = await req.json();
+      const { supplier, requestor, costCenter, neededByDate, paymentTerms } = body;
+
+      if (!supplier || !requestor) {
+        return json({ error: "supplier and requestor are required" }, 400);
+      }
+
+      // Idempotency check
+      const idempotencyKey = req.headers.get("x-idempotency-key");
+      if (idempotencyKey) {
+        const { data: existing } = await supabase
+          .from("purchase_orders")
+          .select("*")
+          .eq("idempotency_key", idempotencyKey)
+          .maybeSingle();
+
+        if (existing) {
+          return json(existing, 200); // return cached result
+        }
+      }
+
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .insert({
+          supplier,
+          requestor,
+          cost_center: costCenter || "",
+          needed_by_date: neededByDate || null,
+          payment_terms: paymentTerms || "Net 30",
+          idempotency_key: idempotencyKey || null,
+        })
+        .select()
+        .single();
+
+      if (error) return json({ error: error.message }, 500);
+      return json(data, 201);
+    }
+
+    // ============================================================
+    // GET /orders — List POs with optional filters
+    // ============================================================
+    if (req.method === "GET" && (path === "/" || path === "/orders")) {
+      const status = url.searchParams.get("status");
+      const supplier = url.searchParams.get("supplier");
+      const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
+      const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "20")));
+      const offset = (page - 1) * limit;
+
+      let query = supabase
+        .from("purchase_orders")
+        .select("*", { count: "exact" })
+        .order("created_at", { ascending: false });
+
+      if (status) query = query.eq("current_status", status);
+      if (supplier) query = query.eq("supplier", supplier);
+
+      query = query.range(offset, offset + limit - 1);
+
+      const { data, error, count } = await query;
+      if (error) return json({ error: error.message }, 500);
+
+      return json({
+        orders: data,
+        pagination: { page, limit, total: count, totalPages: Math.ceil((count || 0) / limit) },
+      });
+    }
+
+    // ============================================================
+    // PATCH /orders/:id — Update draft PO header fields
+    // ============================================================
+    const orderMatch = path.match(/^\/orders\/([^/]+)$/);
+    if (req.method === "PATCH" && orderMatch) {
+      const poId = orderMatch[1];
+      const body = await req.json();
+      const { requestor, costCenter, neededByDate, paymentTerms } = body;
+
+      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      if (!po) return json({ error: "PO not found" }, 404);
+      if (po.current_status !== "Draft") return json({ error: "Can only update Draft POs" }, 422);
+
+      const updates: Record<string, unknown> = {};
+      if (requestor !== undefined) updates.requestor = requestor;
+      if (costCenter !== undefined) updates.cost_center = costCenter;
+      if (neededByDate !== undefined) updates.needed_by_date = neededByDate || null;
+      if (paymentTerms !== undefined) updates.payment_terms = paymentTerms;
+
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .update(updates)
+        .eq("id", poId)
+        .select()
+        .single();
+
+      if (error) return json({ error: error.message }, 500);
+      return json(data);
+    }
+
+    // ============================================================
+    // GET /orders/:id — Single PO with line items + status history
+    // ============================================================
+    if (req.method === "GET" && orderMatch) {
+      const poId = orderMatch[1];
+
+      const [poRes, linesRes, historyRes] = await Promise.all([
+        supabase.from("purchase_orders").select("*").eq("id", poId).single(),
+        supabase
+          .from("po_line_items")
+          .select("*, catalog_item:catalog_items(*)")
+          .eq("po_id", poId)
+          .order("created_at"),
+        supabase
+          .from("po_status_history")
+          .select("*")
+          .eq("po_id", poId)
+          .order("transitioned_at"),
+      ]);
+
+      if (poRes.error || !poRes.data) return json({ error: "PO not found" }, 404);
+
+      return json({
+        ...poRes.data,
+        lineItems: linesRes.data || [],
+        statusHistory: historyRes.data || [],
+      });
+    }
+
+    // ============================================================
+    // POST /orders/:id/lines — Add line item to draft PO
+    // Returns 409 on supplier mismatch
+    // ============================================================
+    const addLineMatch = path.match(/^\/orders\/([^/]+)\/lines$/);
+    if (req.method === "POST" && addLineMatch) {
+      const poId = addLineMatch[1];
+      const body = await req.json();
+      const { catalogItemId, quantity } = body;
+
+      if (!catalogItemId || !quantity || quantity < 1) {
+        return json({ error: "catalogItemId and quantity (>=1) required" }, 400);
+      }
+
+      // Check PO is in Draft
+      const { data: po } = await supabase
+        .from("purchase_orders")
+        .select("current_status, supplier")
+        .eq("id", poId)
+        .single();
+
+      if (!po) return json({ error: "PO not found" }, 404);
+      if (po.current_status !== "Draft") {
+        return json({ error: "Can only add lines to Draft POs" }, 422);
+      }
+
+      // Get catalog item to check supplier + get price
+      const { data: item } = await supabase
+        .from("catalog_items")
+        .select("supplier, price_usd")
+        .eq("id", catalogItemId)
+        .single();
+
+      if (!item) return json({ error: "Catalog item not found" }, 404);
+
+      // Supplier mismatch → 409 Conflict
+      if (item.supplier !== po.supplier) {
+        return json(
+          {
+            error: "Supplier mismatch",
+            detail: `PO is locked to "${po.supplier}" but item belongs to "${item.supplier}"`,
+          },
+          409
+        );
+      }
+
+      // Upsert line item (increment quantity if exists)
+      const { data: existingLine } = await supabase
+        .from("po_line_items")
+        .select("id, quantity")
+        .eq("po_id", poId)
+        .eq("catalog_item_id", catalogItemId)
+        .maybeSingle();
+
+      let result;
+      if (existingLine) {
+        result = await supabase
+          .from("po_line_items")
+          .update({ quantity: existingLine.quantity + quantity })
+          .eq("id", existingLine.id)
+          .select("*, catalog_item:catalog_items(*)")
+          .single();
+      } else {
+        result = await supabase
+          .from("po_line_items")
+          .insert({
+            po_id: poId,
+            catalog_item_id: catalogItemId,
+            quantity,
+            unit_price: item.price_usd,
+          })
+          .select("*, catalog_item:catalog_items(*)")
+          .single();
+      }
+
+      if (result.error) return json({ error: result.error.message }, 500);
+      return json(result.data, 201);
+    }
+
+    // ============================================================
+    // PATCH /orders/:id/lines/:lineId — Update line item quantity
+    // ============================================================
+    const updateLineMatch = path.match(/^\/orders\/([^/]+)\/lines\/([^/]+)$/);
+    if (req.method === "PATCH" && updateLineMatch) {
+      const [, poId, lineId] = updateLineMatch;
+      const body = await req.json();
+      const { quantity } = body;
+
+      if (!quantity || quantity < 1) return json({ error: "quantity must be >= 1" }, 400);
+
+      // Check PO is Draft
+      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      if (!po) return json({ error: "PO not found" }, 404);
+      if (po.current_status !== "Draft") return json({ error: "Can only modify Draft POs" }, 422);
+
+      const { data, error } = await supabase
+        .from("po_line_items")
+        .update({ quantity })
+        .eq("id", lineId)
+        .eq("po_id", poId)
+        .select("*, catalog_item:catalog_items(*)")
+        .single();
+
+      if (error || !data) return json({ error: "Line item not found" }, 404);
+      return json(data);
+    }
+
+    // ============================================================
+    // DELETE /orders/:id/lines/:lineId — Remove line item
+    // ============================================================
+    if (req.method === "DELETE" && updateLineMatch) {
+      const [, poId, lineId] = updateLineMatch;
+
+      const { data: po } = await supabase.from("purchase_orders").select("current_status").eq("id", poId).single();
+      if (!po) return json({ error: "PO not found" }, 404);
+      if (po.current_status !== "Draft") return json({ error: "Can only modify Draft POs" }, 422);
+
+      const { error } = await supabase.from("po_line_items").delete().eq("id", lineId).eq("po_id", poId);
+      if (error) return json({ error: error.message }, 500);
+
+      return json({ success: true }, 200);
+    }
+
+    // ============================================================
+    // POST /orders/:id/submit — Submit draft PO
+    // Idempotent via X-Idempotency-Key
+    // ============================================================
+    const submitMatch = path.match(/^\/orders\/([^/]+)\/submit$/);
+    if (req.method === "POST" && submitMatch) {
+      const poId = submitMatch[1];
+
+      const { data: po } = await supabase.from("purchase_orders").select("*").eq("id", poId).single();
+      if (!po) return json({ error: "PO not found" }, 404);
+      if (po.current_status !== "Draft") {
+        return json({ error: `Cannot submit PO in "${po.current_status}" status` }, 422);
+      }
+
+      // Check it has line items
+      const { count } = await supabase
+        .from("po_line_items")
+        .select("id", { count: "exact", head: true })
+        .eq("po_id", poId);
+
+      if (!count || count === 0) {
+        return json({ error: "Cannot submit PO with no line items" }, 422);
+      }
+
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .update({ current_status: "Submitted" })
+        .eq("id", poId)
+        .select()
+        .single();
+
+      if (error) return json({ error: error.message }, 500);
+      return json(data);
+    }
+
+    // ============================================================
+    // POST /orders/:id/status — Transition PO status
+    // Body: { status: "Approved"|"Rejected"|"Fulfilled", note?: string }
+    // ============================================================
+    const statusMatch = path.match(/^\/orders\/([^/]+)\/status$/);
+    if (req.method === "POST" && statusMatch) {
+      const poId = statusMatch[1];
+      const body = await req.json();
+      const { status, note } = body;
+
+      if (!status) return json({ error: "status is required" }, 400);
+
+      // Update status (DB trigger validates transition)
+      const { data, error } = await supabase
+        .from("purchase_orders")
+        .update({ current_status: status })
+        .eq("id", poId)
+        .select()
+        .single();
+
+      if (error) {
+        if (error.message.includes("Invalid status transition")) {
+          return json({ error: error.message }, 422);
+        }
+        return json({ error: error.message }, 500);
+      }
+
+      // Update the note on the auto-created history entry
+      if (note) {
+        await supabase
+          .from("po_status_history")
+          .update({ note })
+          .eq("po_id", poId)
+          .eq("status", status)
+          .order("transitioned_at", { ascending: false })
+          .limit(1);
+      }
+
+      return json(data);
+    }
+
+    return json({ error: "Not found" }, 404);
+  } catch (err) {
+    return json({ error: err.message }, 500);
+  }
+});
